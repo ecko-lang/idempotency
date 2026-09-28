@@ -1,6 +1,6 @@
 {
   "module": "github.com/ecko-lang/idempotency",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "entrypoint": "main.ecko",
   "description": "Idempotency-Key store for mutating HTTP APIs, backed by std.sql. Stripe-style create-refund semantics: double-clicks do not double-pay.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",
