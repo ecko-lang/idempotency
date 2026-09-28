@@ -1,0 +1,154 @@
+# idempotency - an Idempotency-Key store for mutating HTTP APIs, backed by
+# std.sql. Stripe-style semantics: the first call for a key runs the work and
+# stores its result; a repeat call with the same key and the same request
+# replays the stored result instead of running the work again.
+#
+#   import idempotency
+#
+#   idempotency.init(db)
+#   fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+#   result = idempotency.run(db, "refund-42", fp, fn() charge_refund(42))
+#
+# `db` is a std.sql connection the caller opens and closes - this package
+# never opens or closes one itself, so it needs no capabilities of its own.
+# See README.md for the full semantics (mismatch, in-progress, failure,
+# expiry) and middleware.ecko for the std.web integration.
+
+import std.sql
+import std.json
+import std.time
+import std.hash
+
+# Stripe keeps idempotency keys for 24 hours; that is also a reasonable
+# default here. Pass `opts.ttl_seconds: 0` for a key that never expires.
+DEFAULT_TTL_SECONDS = 86400
+
+fn fail(reason, message) = error({ kind: "idempotency", reason: reason, message: message })
+
+fn row_expired(row, now) = row.expires_at != 0 and now >= row.expires_at
+
+# What an existing row means for this call: the stored result for a
+# completed row with a matching fingerprint, or a thrown error otherwise.
+fn resolve_existing(row, key, request_fingerprint) {
+    if row.fingerprint != request_fingerprint {
+        fail("mismatch", "idempotency key '{key}' was already used with a different request")
+    } else if row.status == "in_progress" {
+        fail("in_progress", "idempotency key '{key}' is still being processed")
+    } else {
+        json.decode(row.response)
+    }
+}
+
+## init(db) -> null. Creates the idempotency_keys table if it does not already
+## exist. `db` is a std.sql connection the caller owns; call this once after
+## opening it, before the first `run`.
+##
+## example:
+##   db = sql.open(":memory:")
+##   idempotency.init(db)
+export fn init(db) {
+    sql.exec(
+        db,
+        "create table if not exists idempotency_keys (" +
+            "key text primary key, " +
+            "fingerprint text not null, " +
+            "status text not null, " +
+            "response text, " +
+            "created_at integer not null, " +
+            "expires_at integer not null)",
+    )
+    null
+}
+
+## run(db, key, request_fingerprint, action, opts?) -> the result of `action()`.
+##
+## The first call for `key` runs `action()`, stores its return value, and
+## returns it. A later call with the same `key` and the same
+## `request_fingerprint` returns the stored value without calling `action`
+## again - the double-click case. A later call with the same `key` and a
+## *different* fingerprint throws `{ kind: "idempotency", reason: "mismatch" }`:
+## the caller reused a key for a different request, which this package refuses
+## rather than guess which one was intended. A call that arrives while an
+## earlier call for the same key is still running throws
+## `{ kind: "idempotency", reason: "in_progress" }` rather than running
+## `action` a second time.
+##
+## If `action` throws, the key is released (its row deleted) before the error
+## is re-thrown, so a retry with the same key runs `action` again. This
+## package does not store failures - matching Stripe, which does not treat a
+## 5xx-like failure as a result worth replaying.
+##
+## `action`'s return value must be JSON-serializable: it is stored with
+## `json.encode` and restored with `json.decode` on replay.
+##
+## `opts` (a map, all keys optional):
+##   ttl_seconds - how long the key is remembered, default 86400 (24h);
+##                 0 means never expire.
+##   now         - a zero-argument function returning the current time in
+##                 unix milliseconds, default `time.now`. Inject a fixed or
+##                 stepped clock to test expiry deterministically.
+##
+## example:
+##   fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+##   result = idempotency.run(db, "refund-42", fp, fn() charge_refund(42))
+export fn run(db, key, request_fingerprint, action, opts = empty_map()) {
+    now_fn = get(opts, "now")
+    now = if now_fn == null { time.now() } else { now_fn() }
+    ttl_opt = get(opts, "ttl_seconds")
+    ttl_seconds = if ttl_opt == null { DEFAULT_TTL_SECONDS } else { ttl_opt }
+    expires_at = if ttl_seconds == 0 { 0 } else { now + ttl_seconds * 1000 }
+
+    mut existing = sql.query_one(db, "select * from idempotency_keys where key = ?", [key])
+    if existing != null and row_expired(existing, now) {
+        sql.exec(db, "delete from idempotency_keys where key = ?", [key])
+        existing = null
+    }
+
+    if existing != null { return resolve_existing(existing, key, request_fingerprint) }
+
+    # Atomically claim the key: this insert succeeds only if no row exists.
+    # It is what makes two simultaneous first calls agree on exactly one
+    # winner without a lock the caller has to manage.
+    inserted = sql.exec(
+        db,
+        "insert or ignore into idempotency_keys" +
+            " (key, fingerprint, status, response, created_at, expires_at)" +
+            " values (?, ?, 'in_progress', null, ?, ?)",
+        [key, request_fingerprint, now, expires_at],
+    )
+    if inserted == 0 {
+        # Lost the race: another call inserted the row between our select and
+        # our insert. Whoever won owns running `action`; we replay or refuse.
+        row = sql.query_one(db, "select * from idempotency_keys where key = ?", [key])
+        if row == null {
+            return fail("in_progress", "idempotency key '{key}' is being processed concurrently")
+        }
+        return resolve_existing(row, key, request_fingerprint)
+    }
+
+    try {
+        result = action()
+        sql.exec(
+            db,
+            "update idempotency_keys set status = 'completed', response = ? where key = ?",
+            [json.encode(result), key],
+        )
+        result
+    } catch (e) {
+        sql.exec(db, "delete from idempotency_keys where key = ?", [key])
+        error(e)
+    }
+}
+
+## fingerprint(method, path, body) -> a sha256 hex digest identifying a request.
+##
+## `body` is JSON-encoded before hashing, so any JSON-serializable value works
+## (a map, a list, a string, null). Two calls with the same method, path and
+## body produce the same digest; `run` uses this to tell a legitimate replay
+## from a caller reusing a key for a different request.
+##
+## example:
+##   idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+export fn fingerprint(method, path, body) = hash.sha256(
+    method + "\n" + path + "\n" + json.encode(body),
+)

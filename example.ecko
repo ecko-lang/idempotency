@@ -1,0 +1,70 @@
+# idempotency - a Stripe-style create-refund demo, run offline.
+#
+#   ecko example.ecko
+#
+# Simulates a client double-clicking "refund" and a server retry after a
+# dropped connection - neither should charge twice. Deterministic: run it
+# twice, get the same output both times.
+
+import std.sql
+import "./main.ecko" as idempotency
+
+db = sql.open(":memory:")
+idempotency.init(db)
+
+charges = cell(0)
+
+fn charge_refund(order_id, amount) {
+    cell_update(charges, fn(v) v + 1)
+    { refund_id: "re_{order_id}", amount: amount, status: "succeeded" }
+}
+
+key = "idem-order-42"
+fp = idempotency.fingerprint("POST", "/v1/refunds", { order_id: 42, amount: 500 })
+
+print("--- first click ---")
+first = idempotency.run(db, key, fp, fn() charge_refund(42, 500))
+n1 = cell_get(charges)
+print("response: {first}")
+print("charges made so far: {n1}")
+
+print("")
+print("--- double-click: same key, same request ---")
+second = idempotency.run(db, key, fp, fn() charge_refund(42, 500))
+n2 = cell_get(charges)
+print("response: {second}")
+print("charges made so far: {n2}")
+
+print("")
+print("--- same key reused for a different request ---")
+different_fp = idempotency.fingerprint("POST", "/v1/refunds", { order_id: 42, amount: 999 })
+try { idempotency.run(db, key, different_fp, fn() charge_refund(42, 999)) } catch (e) {
+    reason = get(e, "reason")
+    message = get(e, "message")
+    print("refused: reason={reason} message={message}")
+}
+
+print("")
+print("--- a failed attempt does not block a retry ---")
+attempts = cell(0)
+retry_key = "idem-order-7"
+retry_fp = idempotency.fingerprint("POST", "/v1/refunds", { order_id: 7, amount: 250 })
+
+fn flaky_refund() {
+    n = cell_get(attempts)
+    cell_update(attempts, fn(v) v + 1)
+    if n == 0 {
+        error({ kind: "payment", message: "issuer timeout" })
+    } else {
+        charge_refund(7, 250)
+    }
+}
+
+try { idempotency.run(db, retry_key, retry_fp, flaky_refund) } catch (e) {
+    message = get(e, "message")
+    print("attempt 1 failed: {message}")
+}
+retried = idempotency.run(db, retry_key, retry_fp, flaky_refund)
+print("attempt 2 succeeded: {retried}")
+
+sql.close(db)

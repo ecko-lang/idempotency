@@ -1,0 +1,273 @@
+# Behavioural tests for the idempotency package - run offline via `ecko test`.
+# Every test opens its own `:memory:` sqlite database, so cases are
+# independent and nothing touches disk.
+import std.test
+import std.sql
+import "../main.ecko"
+idempotency = main
+
+fn fresh_db() {
+    db = sql.open(":memory:")
+    idempotency.init(db)
+    db
+}
+
+# A clock a test can step by hand, for deterministic TTL behaviour.
+fn fake_clock(start) {
+    t = cell(start)
+    { now: fn() cell_get(t), advance: fn(ms) cell_update(t, fn(v) v + ms) }
+}
+
+test.case("first call runs the action and stores its result", fn() {
+    db = fresh_db()
+    calls = cell(0)
+    fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    result = idempotency.run(db, "refund-1", fp, fn() {
+        cell_update(calls, fn(v) v + 1)
+        { refund_id: "re_1", amount: 500 }
+    })
+    test.eq(result, { refund_id: "re_1", amount: 500 })
+    test.eq(cell_get(calls), 1)
+    sql.close(db)
+})
+
+test.case("a repeat with the same key and fingerprint replays without running again", fn() {
+    db = fresh_db()
+    calls = cell(0)
+    fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    action = fn() {
+        cell_update(calls, fn(v) v + 1)
+        { refund_id: "re_2", amount: 500 }
+    }
+    first = idempotency.run(db, "refund-2", fp, action)
+    second = idempotency.run(db, "refund-2", fp, action)
+    third = idempotency.run(db, "refund-2", fp, action)
+    test.eq(first, second)
+    test.eq(second, third)
+    test.eq(cell_get(calls), 1)
+    sql.close(db)
+})
+
+test.case("a repeat with the same key and a different fingerprint throws a mismatch error", fn() {
+    db = fresh_db()
+    fp1 = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    fp2 = idempotency.fingerprint("POST", "/v1/refunds", { amount: 999 })
+    idempotency.run(db, "refund-3", fp1, fn() "first")
+    try {
+        idempotency.run(db, "refund-3", fp2, fn() "second")
+        test.fail("expected a mismatch error")
+    } catch (e) {
+        test.eq(get(e, "kind"), "idempotency")
+        test.eq(get(e, "reason"), "mismatch")
+    }
+    sql.close(db)
+})
+
+test.case(
+    "a concurrent repeat while the first call is still running throws an in-progress error",
+    fn() {
+        db = fresh_db()
+        fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+        saw_in_progress = cell(false)
+        outer = fn() {
+            # A second call for the same key, made from inside the first call's
+            # own action - this is what "still in progress" looks like without
+            # needing real threads: the row is already marked in_progress.
+            try {
+                idempotency.run(db, "refund-4", fp, fn() "should not run")
+                test.fail("expected an in-progress error")
+            } catch (e) {
+                test.eq(get(e, "kind"), "idempotency")
+                test.eq(get(e, "reason"), "in_progress")
+                cell_set(saw_in_progress, true)
+            }
+            "outer-result"
+        }
+        result = idempotency.run(db, "refund-4", fp, outer)
+        test.eq(result, "outer-result")
+        test.ok(cell_get(saw_in_progress), "the nested call observed in_progress")
+        sql.close(db)
+    },
+)
+
+test.case("a failing action releases the key so a retry can run it again", fn() {
+    db = fresh_db()
+    fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    attempts = cell(0)
+    failing_then_ok = fn() {
+        n = cell_get(attempts)
+        cell_update(attempts, fn(v) v + 1)
+        if n == 0 {
+            error({ kind: "payment", message: "card declined" })
+        } else {
+            { refund_id: "re_5", amount: 500 }
+        }
+    }
+    try {
+        idempotency.run(db, "refund-5", fp, failing_then_ok)
+        test.fail("expected the first attempt to throw")
+    } catch (e) {
+        test.eq(get(e, "kind"), "payment")
+        test.eq(get(e, "message"), "card declined")
+    }
+    retried = idempotency.run(db, "refund-5", fp, failing_then_ok)
+    test.eq(retried, { refund_id: "re_5", amount: 500 })
+    test.eq(cell_get(attempts), 2)
+    sql.close(db)
+})
+
+test.case("a stored key expires after ttl_seconds and the action runs again", fn() {
+    db = fresh_db()
+    clock = fake_clock(0)
+    opts = { ttl_seconds: 10, now: clock.now }
+    fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    calls = cell(0)
+    action = fn() {
+        cell_update(calls, fn(v) v + 1)
+        "v{cell_get(calls)}"
+    }
+
+    first = idempotency.run(db, "refund-6", fp, action, opts)
+    test.eq(first, "v1")
+
+    clock.advance(5000)  # 5s in - well inside the 10s ttl
+    replayed = idempotency.run(db, "refund-6", fp, action, opts)
+    test.eq(replayed, "v1")
+    test.eq(cell_get(calls), 1)
+
+    clock.advance(6000)  # 11s in total - past the 10s ttl
+    after_expiry = idempotency.run(db, "refund-6", fp, action, opts)
+    test.eq(after_expiry, "v2")
+    test.eq(cell_get(calls), 2)
+    sql.close(db)
+})
+
+test.case("ttl_seconds: 0 means a key never expires", fn() {
+    db = fresh_db()
+    clock = fake_clock(0)
+    opts = { ttl_seconds: 0, now: clock.now }
+    fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    calls = cell(0)
+    action = fn() {
+        cell_update(calls, fn(v) v + 1)
+        "v1"
+    }
+    idempotency.run(db, "refund-7", fp, action, opts)
+    clock.advance(1000 * 60 * 60 * 24 * 365)  # a year later
+    replayed = idempotency.run(db, "refund-7", fp, action, opts)
+    test.eq(replayed, "v1")
+    test.eq(cell_get(calls), 1)
+    sql.close(db)
+})
+
+test.case("different keys are independent", fn() {
+    db = fresh_db()
+    fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    calls = cell(0)
+    action = fn() {
+        cell_update(calls, fn(v) v + 1)
+        cell_get(calls)
+    }
+    a = idempotency.run(db, "refund-a", fp, action)
+    b = idempotency.run(db, "refund-b", fp, action)
+    test.eq(a, 1)
+    test.eq(b, 2)
+    sql.close(db)
+})
+
+test.case("init is safe to call more than once", fn() {
+    db = sql.open(":memory:")
+    idempotency.init(db)
+    idempotency.init(db)
+    fp = idempotency.fingerprint("GET", "/x", null)
+    result = idempotency.run(db, "k", fp, fn() "ok")
+    test.eq(result, "ok")
+    sql.close(db)
+})
+
+test.case("fingerprint is stable and distinguishes method, path and body", fn() {
+    a = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    b = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+    c = idempotency.fingerprint("POST", "/v1/refunds", { amount: 501 })
+    d = idempotency.fingerprint("POST", "/v1/charges", { amount: 500 })
+    e = idempotency.fingerprint("GET", "/v1/refunds", { amount: 500 })
+    test.eq(a, b)
+    test.ok(a != c, "different body -> different fingerprint")
+    test.ok(a != d, "different path -> different fingerprint")
+    test.ok(a != e, "different method -> different fingerprint")
+})
+
+# ---- middleware: offline, no server - a plain request map and a plain `next` ---
+
+fn fake_req(method, path, key, body) = {
+    method: method,
+    path: path,
+    headers: if key == null { empty_map() } else { { "idempotency-key": key } },
+    body: body,
+}
+
+test.case("middleware replays a POST with the same Idempotency-Key without re-invoking next", fn() {
+    db = fresh_db()
+    mw = idempotency.middleware(db)
+    calls = cell(0)
+    next = fn(req) {
+        cell_update(calls, fn(v) v + 1)
+        { status: 200, headers: {}, body: "created" }
+    }
+    req = fake_req("POST", "/v1/refunds", "key-1", r"""{"amount":500}""")
+    first = mw(req, next)
+    second = mw(req, next)
+    test.eq(first, second)
+    test.eq(cell_get(calls), 1)
+    sql.close(db)
+})
+
+test.case(
+    "middleware raises a mismatch error when the same key is replayed with a different body",
+    fn() {
+        db = fresh_db()
+        mw = idempotency.middleware(db)
+        next = fn(req) ({ status: 200, headers: {}, body: "ok" })
+        req1 = fake_req("POST", "/v1/refunds", "key-2", r"""{"amount":500}""")
+        req2 = fake_req("POST", "/v1/refunds", "key-2", r"""{"amount":999}""")
+        mw(req1, next)
+        try {
+            mw(req2, next)
+            test.fail("expected a mismatch error")
+        } catch (e) {
+            test.eq(get(e, "kind"), "idempotency")
+            test.eq(get(e, "reason"), "mismatch")
+        }
+        sql.close(db)
+    },
+)
+
+test.case("middleware passes GET requests straight through, every time", fn() {
+    db = fresh_db()
+    mw = idempotency.middleware(db)
+    calls = cell(0)
+    next = fn(req) {
+        cell_update(calls, fn(v) v + 1)
+        { status: 200, headers: {}, body: "ok" }
+    }
+    req = fake_req("GET", "/v1/refunds", "key-3", "")
+    mw(req, next)
+    mw(req, next)
+    test.eq(cell_get(calls), 2)
+    sql.close(db)
+})
+
+test.case("middleware passes a POST with no Idempotency-Key straight through, every time", fn() {
+    db = fresh_db()
+    mw = idempotency.middleware(db)
+    calls = cell(0)
+    next = fn(req) {
+        cell_update(calls, fn(v) v + 1)
+        { status: 200, headers: {}, body: "ok" }
+    }
+    req = fake_req("POST", "/v1/refunds", null, r"""{"amount":500}""")
+    mw(req, next)
+    mw(req, next)
+    test.eq(cell_get(calls), 2)
+    sql.close(db)
+})

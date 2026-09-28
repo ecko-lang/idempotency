@@ -1,0 +1,16 @@
+# idempotency - an Idempotency-Key store for mutating HTTP APIs, backed by
+# std.sql. Stripe-style semantics: the first call for a key runs and stores;
+# a repeat with the same key and request replays the stored result; a repeat
+# with a different request throws.
+#
+#   import idempotency
+#
+#   idempotency.init(db)
+#   fp = idempotency.fingerprint("POST", "/v1/refunds", { amount: 500 })
+#   result = idempotency.run(db, "refund-42", fp, fn() charge_refund(42))
+#
+# This entrypoint curates the public surface from its two source files; both
+# already export only what is meant to be public, so both are re-exported in
+# full.
+export * from "./idempotency.ecko"
+export * from "./middleware.ecko"

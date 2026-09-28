@@ -1,0 +1,13 @@
+# Ecko package - generated / build artifacts
+
+# `ecko pack` output
+*.zip
+
+# Package-extraction staging dirs (ecko get/install)
+vendor/.staging-*/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~

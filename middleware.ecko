@@ -1,0 +1,44 @@
+# middleware - a std.web-shaped middleware wrapping `run` around a request
+# header, for a server that wants Idempotency-Key handling without wiring it
+# into every handler by hand.
+#
+#   import std.web
+#   import idempotency
+#
+#   app = web.router(routes, [idempotency.middleware(db)])
+#
+# This file imports nothing from std.http or std.web - a middleware is just a
+# `fn(req, next)` value by convention, so it can be built and unit-tested with
+# a plain request map and a plain `next` function, no server required.
+
+import "./idempotency.ecko"
+
+fn is_guarded_method(method) = method == "POST" or method == "PATCH" or method == "DELETE"
+
+## middleware(db, opts?) -> a `fn(req, next)` for `web.router`'s middleware list.
+##
+## For POST/PATCH/DELETE requests carrying an `Idempotency-Key` header, wraps
+## `next(req)` with `run`: a repeat request with the same key and the same
+## method/path/body replays the stored response instead of calling `next`
+## again; a repeat with a different body throws the same
+## `{ kind: "idempotency", reason: "mismatch" }` / `"in_progress"` errors as
+## `run` (see idempotency.ecko). Requests with no key, and GET/PUT/HEAD
+## requests, pass straight through to `next` untouched.
+##
+## `opts` is passed to `run` as-is (`ttl_seconds`, `now`).
+##
+## `next(req)`'s return value must be JSON-serializable for replay to work -
+## a plain `http.json(...)` or `http.text(...)` response qualifies; a
+## streamed or raw-bytes response does not (see README "Middleware").
+##
+## example:
+##   app = web.router(routes, [idempotency.middleware(db, { ttl_seconds: 3600 })])
+export fn middleware(db, opts = empty_map()) {
+    fn(req, next) {
+        key = get(req.headers, "idempotency-key")
+        if key == null or not is_guarded_method(req.method) { next(req) } else {
+            fp = idempotency.fingerprint(req.method, req.path, req.body)
+            idempotency.run(db, key, fp, fn() next(req), opts)
+        }
+    }
+}
